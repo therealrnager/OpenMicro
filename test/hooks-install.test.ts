@@ -24,6 +24,46 @@ function read(): {
   return JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
 }
 
+describe.each([
+  ['Claude', installClaudeHooks],
+  ['Codex', installCodexHooks],
+] as const)('%s hook preservation', (_name, install) => {
+  it.each(['null', '[]', '42', '{"hooks": []}', '{"hooks":{"Stop":{}}}'])(
+    'rejects invalid settings without modifying them: %s',
+    (contents) => {
+      fs.writeFileSync(settingsPath, contents)
+      expect(install(settingsPath)).toBe('failed')
+      expect(fs.readFileSync(settingsPath, 'utf8')).toBe(contents)
+    },
+  )
+
+  it('preserves foreign hooks sharing a group with an OpenMicro hook', () => {
+    const foreign = { type: 'command', command: '/my/important-hook', timeout: 30 }
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              matcher: '*',
+              custom: true,
+              hooks: [
+                foreign,
+                { type: 'command', command: 'curl http://127.0.0.1:48762/om-hook/Stop-old' },
+              ],
+            },
+          ],
+        },
+      }),
+    )
+    expect(install(settingsPath)).toBe('changed')
+    expect(read().hooks.Stop).toContainEqual({ matcher: '*', custom: true, hooks: [foreign] })
+    const first = fs.readFileSync(settingsPath, 'utf8')
+    expect(install(settingsPath)).toBe('unchanged')
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(first)
+  })
+})
+
 describe('installClaudeHooks', () => {
   it('creates settings.json with all openmicro hook events', () => {
     expect(installClaudeHooks(settingsPath)).toBe('changed')
@@ -38,20 +78,19 @@ describe('installClaudeHooks', () => {
       'SessionEnd',
     ]) {
       expect(settings.hooks[event], event).toHaveLength(1)
-      expect(settings.hooks[event]![0]!.hooks[0]!.command).toContain(`/om-hook/${event}`)
+      expect(settings.hooks[event]![0]!.hooks[0]!.command).toContain(`'${event}'`)
     }
     expect(settings.hooks.PreToolUse![0]!.matcher).toBe('AskUserQuestion')
   })
 
-  it('uses port 48762 and the /om-hook/ path — never the bare /hook/ marker', () => {
+  it('installs the authenticated helper without embedding a credential', () => {
     installClaudeHooks(settingsPath)
     const command = read().hooks.Stop![0]!.hooks[0]!.command
-    expect(command).toBe(
-      'curl -s --max-time 1 -X POST http://127.0.0.1:48762/om-hook/Stop -H \'Content-Type: application/json\' -H "X-Openmicro-Instance-Id: $OPENMICRO_INSTANCE_ID" -H "X-Herdr-Pane-Id: $HERDR_PANE_ID" -d @- >/dev/null 2>&1 || true',
-    )
-    // Coexistence guard: vibesense purges any command containing the bare
-    // substring `/hook/`. Ours must never contain it.
-    expect(command.includes('/hook/')).toBe(false)
+    expect(command).toContain('hook-forward.js')
+    expect(command).toContain("'Stop'")
+    expect(command).toContain('# openmicro:hook-forward')
+    expect(command).not.toContain('Bearer')
+    expect(command).not.toContain('/hook/')
   })
 
   it('is idempotent — running twice yields an identical file', () => {
@@ -85,7 +124,7 @@ describe('installClaudeHooks', () => {
     const stopCommands = settings.hooks.Stop!.flatMap((g) => g.hooks.map((h) => h.command))
     expect(stopCommands).toContain('/my/other/hook.sh')
     expect(stopCommands).toContain('curl http://127.0.0.1:48753/hook/Stop >/dev/null') // vibesense entry preserved
-    expect(stopCommands.some((c) => c.includes('/om-hook/Stop'))).toBe(true)
+    expect(stopCommands.some((c) => c.includes('hook-forward.js'))).toBe(true)
   })
 
   it('replaces stale openmicro entries instead of accumulating them', () => {
@@ -124,9 +163,9 @@ describe('installCodexHooks', () => {
       expect(groups).toHaveLength(1)
       expect(groups[0]!.matcher, event).toBeUndefined()
       const command = groups[0]!.hooks[0]!.command
-      expect(command).toContain(`/om-hook/${event}`)
-      expect(command).toContain('X-Openmicro-Instance-Id: $OPENMICRO_INSTANCE_ID')
-      expect(command).toContain('X-Herdr-Pane-Id: $HERDR_PANE_ID')
+      expect(command).toContain(`'${event}'`)
+      expect(command).toContain('hook-forward.js')
+      expect(command).toContain('# openmicro:hook-forward')
       expect(command).toContain("printf '{}'")
       expect(command.includes('/hook/')).toBe(false) // coexistence guard
     }
@@ -189,7 +228,7 @@ describe('installCodexHooks', () => {
     )
     expect(commands).toContain('curl https://example.com/hook/Stop')
     // exactly one fresh openmicro entry (the stale one replaced)
-    expect(commands.filter((c) => c.includes('X-Openmicro-Instance-Id'))).toHaveLength(1)
+    expect(commands.filter((c) => c.includes('# openmicro:hook-forward'))).toHaveLength(1)
   })
 
   it('leaves invalid JSON untouched and reports failure', () => {

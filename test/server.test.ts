@@ -2,6 +2,7 @@
 // /om-hook/<event> drive the aggregate (classified through the reporting
 // session's harness), and SSE streams forward keystrokes to client instances.
 
+import { request } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { harnessFor } from '../src/harness/index.js'
 import { releaseAgent, reportAgentState } from '../src/herdr.js'
@@ -11,12 +12,19 @@ import type { Aggregate } from '../src/state.js'
 vi.mock('../src/herdr.js', () => ({ reportAgentState: vi.fn(), releaseAgent: vi.fn() }))
 
 const claude = harnessFor('claude')
+const TOKEN = 'a'.repeat(64)
+const rawFetch = globalThis.fetch
+const fetch: typeof globalThis.fetch = (input, init) => {
+  const headers = new Headers(init?.headers)
+  headers.set('Authorization', `Bearer ${TOKEN}`)
+  return rawFetch(input, { ...init, headers })
+}
 
 let server: HostServer
 let base: string
 
 beforeEach(async () => {
-  server = new HostServer(claude)
+  server = new HostServer(claude, undefined, TOKEN)
   await server.listen(0) // ephemeral port so tests never collide with a running host
   base = `http://127.0.0.1:${server.boundPort}`
 })
@@ -63,6 +71,69 @@ async function nextFrame(body: ReadableStream<Uint8Array>): Promise<Record<strin
 }
 
 describe('HostServer', () => {
+  it('rejects browser-origin requests before changing state', async () => {
+    const response = await fetch(`${base}/om-hook/UserPromptSubmit`, {
+      method: 'POST',
+      headers: { Origin: 'https://untrusted.example' },
+      body: JSON.stringify({ session_id: 'injected' }),
+    })
+    expect(response.status).toBe(403)
+    expect(server.tracker.list()).toEqual([])
+  })
+
+  it('rejects a foreign Host header used by DNS rebinding', async () => {
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      const req = request(`${base}/health`, { headers: { Host: 'untrusted.example' } }, (res) => {
+        res.resume()
+        resolve(res.statusCode)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    expect(status).toBe(403)
+  })
+
+  it('does not open an unregistered keystroke stream', async () => {
+    const response = await fetch(`${base}/instance/guess`)
+    try {
+      expect(response.status).toBe(404)
+    } finally {
+      await response.body?.cancel()
+    }
+  })
+
+  it('does not let a second connection replace an active keystroke stream', async () => {
+    const reg = await fetch(`${base}/register`, {
+      method: 'POST',
+      body: JSON.stringify({ cwd: '/tmp/p', wrapperId: 'w', kind: 'claude' }),
+    })
+    const { instanceId } = (await reg.json()) as { instanceId: string }
+    const original = await fetch(`${base}/instance/${instanceId}`)
+    const duplicate = await fetch(`${base}/instance/${instanceId}`)
+    try {
+      expect(duplicate.status).toBe(409)
+      expect(server.sendKeysToInstance(instanceId, 'private prompt')).toBe(true)
+      expect(await nextFrame(original.body!)).toMatchObject({ type: 'keys' })
+    } finally {
+      await original.body?.cancel()
+      await duplicate.body?.cancel()
+    }
+  })
+
+  it('rejects oversized hook requests', async () => {
+    const response = await fetch(`${base}/om-hook/UserPromptSubmit`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: 'large', text: 'x'.repeat(1_048_577) }),
+    })
+    expect(response.status).toBe(413)
+    expect(server.tracker.list()).toEqual([])
+  })
+
+  it('rejects requests without the per-user credential', async () => {
+    const response = await rawFetch(`${base}/register`, { method: 'POST', body: '{}' })
+    expect(response.status).toBe(401)
+  })
+
   it('identifies itself on /health', async () => {
     const res = await fetch(`${base}/health`)
     expect(await res.json()).toEqual({ app: 'openmicro' })
@@ -129,7 +200,7 @@ describe('HostServer', () => {
   it('classifies each session with its own registered harness kind', async () => {
     // Claude has no PermissionRequest event (→ null), Codex maps it to waiting.
     // Registering the instance as codex must make PermissionRequest pause.
-    const scoped = new HostServer(claude, 'host-wrapper')
+    const scoped = new HostServer(claude, 'host-wrapper', TOKEN)
     await scoped.listen(0)
     const scopedBase = `http://127.0.0.1:${scoped.boundPort}`
     const aggregates: Aggregate[] = []
@@ -158,7 +229,7 @@ describe('HostServer', () => {
   })
 
   it('accepts owned host hooks and ignores unknown wrapper IDs', async () => {
-    const owned = new HostServer(claude, 'host-wrapper')
+    const owned = new HostServer(claude, 'host-wrapper', TOKEN)
     await owned.listen(0)
     const ownedBase = `http://127.0.0.1:${owned.boundPort}`
     const aggregates: Aggregate[] = []
@@ -193,7 +264,7 @@ describe('HostServer', () => {
   })
 
   it('emits prompt-submit with host ownership so stale voice tracking can be dropped', async () => {
-    const owned = new HostServer(claude, 'host-wrapper')
+    const owned = new HostServer(claude, 'host-wrapper', TOKEN)
     await owned.listen(0)
     const ownedBase = `http://127.0.0.1:${owned.boundPort}`
     const submits: Array<{ sessionId: string; hostOwned: boolean }> = []
@@ -320,7 +391,7 @@ describe('HostServer', () => {
     expect(reportAgentState).not.toHaveBeenCalled()
 
     // Untrusted (unknown wrapper on a scoped server) must not leak to herdr.
-    const scoped = new HostServer(claude, 'host-wrapper')
+    const scoped = new HostServer(claude, 'host-wrapper', TOKEN)
     await scoped.listen(0)
     try {
       await fetch(`http://127.0.0.1:${scoped.boundPort}/om-hook/UserPromptSubmit`, {
@@ -338,7 +409,7 @@ describe('HostServer', () => {
     // The Codex desktop app has no OPENMICRO_INSTANCE_ID env, so its hook
     // curls send an empty ownership header. A usesPty:false host adopts them;
     // a CLI host (previous test's scoped server) keeps ignoring them.
-    const gui = new HostServer(harnessFor('codex-app'), 'gui-host')
+    const gui = new HostServer(harnessFor('codex-app'), 'gui-host', TOKEN)
     await gui.listen(0)
     const guiBase = `http://127.0.0.1:${gui.boundPort}`
     const aggregates: Aggregate[] = []
@@ -365,7 +436,7 @@ describe('HostServer', () => {
     // session has no OPENMICRO_INSTANCE_ID, so its hooks carry no ownership
     // header — it must not enter the tracker (it would pollute focus cycling
     // and pin state), even when its cwd matches a wrapped session's.
-    const scoped = new HostServer(claude, 'host-wrapper')
+    const scoped = new HostServer(claude, 'host-wrapper', TOKEN)
     await scoped.listen(0)
     const scopedBase = `http://127.0.0.1:${scoped.boundPort}`
     const aggregates: Aggregate[] = []

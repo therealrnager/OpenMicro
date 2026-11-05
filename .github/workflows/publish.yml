@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   publish:
+    if: github.repository == 'stephenleo/OpenMicro'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

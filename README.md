@@ -4,17 +4,25 @@
 
 Bring Codex Micro to any gaming controller and coding harness
 
-## Start in 60 seconds
+## Maintained personal fork
 
-You need macOS, Node.js 22 or newer, Claude Code or Codex CLI, and a connected controller. OpenMicro is macOS-first; other platforms are not yet tested.
+This is [therealrnager/OpenMicro](https://github.com/therealrnager/OpenMicro), based on upstream v1.4.3. It adds authenticated local communication, restricted desktop commands, safer hook updates, input cleanup, and dependency security updates. See [SECURITY.md](SECURITY.md) for the reviewed boundaries and remaining risks.
+
+## Run this fork from source
+
+Use macOS and Node.js 24 (the version in `.nvmrc`). The npm package named `openmicro` belongs to upstream and does not include this fork's patches.
 
 ```sh
-npm i -g openmicro
-
-openmicro claude # or just: openmicro
-openmicro codex
-openmicro codex-app # drive the Codex macOS desktop app
+git clone https://github.com/therealrnager/OpenMicro.git
+cd OpenMicro
+nvm use
+npm ci
+npm run build
+node dist/cli.js codex-app
+# Other harnesses: node dist/cli.js claude / node dist/cli.js codex
 ```
+
+Stop old OpenMicro instances before starting this fork: its authenticated protocol intentionally rejects older clients and hosts. The first launch creates a private `~/.openmicro/auth-token` and replaces OpenMicro's old curl hooks with an authenticated helper. Keep this checkout at the same path while those hooks are installed; launching again reinstalls them after a move. To inspect your controller, run `node dist/cli.js doctor`.
 
 `openmicro codex-app` drives the Codex desktop app instead of a terminal CLI: new chat and prompt prefill use `codex://` deep links (no permission needed), while submit (Enter), reject (Esc), dictation (Ctrl+Shift+D), d-pad arrows, and Ctrl+U send keystrokes and need Accessibility permission for your terminal. A stick-flick prompt prefills the composer; press submit to send it. The app launches automatically and the terminal shows live status (controller, actions, agent state).
 

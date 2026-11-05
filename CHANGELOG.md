@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security (personal fork)
+
+- Authenticate loopback clients, streams, focus reports, and hooks using a private per-user credential; verify a nonce-based host proof before sending credentials or hook content.
+- Reject browser-origin requests and foreign Host headers, bound request bodies, use random registration IDs, and prevent unregistered or duplicate stream attachments.
+- Restrict the desktop executor to known controller shortcuts and validated Codex deep links.
+- Update vulnerable dependencies and test tooling; constrain the affected ESLint transitive minimatch dependency to its fixed major version.
+
+### Fixed (personal fork)
+
+- Preserve unrelated commands in shared hook groups; reject malformed settings and replace valid files atomically.
+- Release repeats and dictation on layer changes and disconnects; clear stale controller state on reconnect.
+- Cancel queued AppleScript chords and terminate an active script on shutdown before releasing held keys.
+- Keep GUI control commands directed to the desktop harness instead of forwarding tagged commands into a terminal instance.
+
+### Documentation (personal fork)
+
+- Document source installation, protocol migration, the security boundary, and hardware verification limits. Disable upstream npm publishing from forks.
+
 ## [1.4.3] - 2026-08-23
 
 ### Added
