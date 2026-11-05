@@ -7,8 +7,9 @@ Thanks for helping build the open Codex Micro replica. There are three ways in, 
 The most valuable contribution: run the hardware diagnostic and submit the result.
 
 ```bash
-npm i -g openmicro
-openmicro doctor
+npm ci
+npm run build
+node dist/cli.js doctor
 ```
 
 It writes a report named by your controller's identity (e.g. `054c-0ce6-usb.json`). Open a PR adding that file to `test/fixtures/controllers/` — unedited — then run `npm run gen:controllers` so the README table includes your pad. CI replays your captured button presses through the parsers on every future build.
@@ -24,8 +25,8 @@ OpenMicro drives any agent CLI through the `Harness` interface — see "Adding a
 ## 3. Core changes
 
 ```bash
-git clone https://github.com/stephenleo/OpenMicro && cd OpenMicro
-npm install        # Node >= 22, macOS-first (native deps: node-hid, node-pty)
+git clone https://github.com/therealrnager/OpenMicro && cd OpenMicro
+npm ci             # Node 24 recommended, macOS-first (native deps: node-hid, node-pty)
 npm run verify     # typecheck + lint + format:check + tests — must be green
 ```
 

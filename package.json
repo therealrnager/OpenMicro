@@ -6,7 +6,7 @@
   "author": "stephenleo",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/stephenleo/OpenMicro.git"
+    "url": "git+https://github.com/therealrnager/OpenMicro.git"
   },
   "type": "module",
   "bin": {
@@ -47,7 +47,7 @@
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper ../node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
     "prepublishOnly": "npm run build",
     "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx src/cli.ts",
+    "dev": "npm run build && tsx src/cli.ts",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
@@ -61,7 +61,7 @@
     "dualsense-ts": "^6.15.0",
     "node-hid": "^3.3.0",
     "node-pty": "^1.1.0",
-    "zod": "^4.3.6"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -70,6 +70,11 @@
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.0.0",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
   }
 }

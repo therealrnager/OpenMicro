@@ -5,6 +5,8 @@
 // controller, not a browser tab.
 
 import { EventEmitter } from 'node:events'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { hostProof, secretEquals } from './auth.js'
 import http from 'node:http'
 import { harnessFor } from './harness/index.js'
 import type { Harness } from './harness/types.js'
@@ -44,12 +46,27 @@ function send(res: http.ServerResponse, payload: unknown): void {
   res.write(`data: ${JSON.stringify(payload)}\n\n`)
 }
 
+class RequestError extends Error {
+  constructor(readonly status: number) {
+    super(`Invalid local request (${status})`)
+  }
+}
+
 function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
-    let body = ''
-    req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')))
-    req.on('end', () => resolve(body))
-    req.on('error', () => resolve(body))
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > 1_048_576) {
+        reject(new RequestError(413))
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+    req.on('aborted', () => reject(new RequestError(400)))
   })
 }
 
@@ -72,7 +89,6 @@ export class HostServer extends EventEmitter {
     { res: http.ServerResponse; cwd: string; wrapperId: string | null }
   >()
   private pendingInstances = new Map<string, { cwd: string; wrapperId: string | null }>()
-  private nextInstanceId = 1
 
   /**
    * hostHarness classifies the host's own session's hooks (and any hook whose
@@ -84,6 +100,7 @@ export class HostServer extends EventEmitter {
   constructor(
     private readonly hostHarness: Harness,
     private readonly hostWrapperId?: string,
+    private readonly token: string = randomBytes(32).toString('hex'),
   ) {
     super()
     this.tracker = new SessionTracker({
@@ -101,10 +118,12 @@ export class HostServer extends EventEmitter {
       const server = http.createServer((req, res) => {
         this.handle(req, res).catch((err) => {
           logger.error('server request failed', err)
-          if (!res.headersSent) res.writeHead(500)
+          if (!res.headersSent) res.writeHead(err instanceof RequestError ? err.status : 500)
           res.end()
         })
       })
+      server.requestTimeout = 5000
+      server.headersTimeout = 5000
       server.once('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE') resolve(false)
         else reject(err)
@@ -161,12 +180,38 @@ export class HostServer extends EventEmitter {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', HOST_URL)
+    // This service has no browser UI. Reject cross-origin and DNS-rebinding
+    // traffic before it can register clients, inject hooks, or open streams.
+    const localHosts = [`127.0.0.1:${this.boundPort}`, `localhost:${this.boundPort}`]
+    if (
+      !localHosts.includes(req.headers.host ?? '') ||
+      req.headers.origin !== undefined ||
+      !req.url?.startsWith('/') ||
+      req.url.startsWith('//')
+    ) {
+      res.writeHead(403)
+      res.end()
+      return
+    }
+    const url = new URL(req.url, HOST_URL)
     const { pathname } = url
 
-    if (pathname === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ app: 'openmicro' }))
+    if (req.method === 'GET' && pathname === '/health') {
+      const challenge = url.searchParams.get('challenge')
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      res.end(
+        JSON.stringify({
+          app: 'openmicro',
+          ...(challenge && /^[a-f0-9]{64}$/.test(challenge)
+            ? { proof: hostProof(this.token, challenge) }
+            : {}),
+        }),
+      )
+      return
+    }
+    if (!secretEquals(req.headers.authorization, `Bearer ${this.token}`)) {
+      res.writeHead(401)
+      res.end()
       return
     }
 
@@ -196,7 +241,7 @@ export class HostServer extends EventEmitter {
       return
     }
 
-    if (pathname.startsWith('/instance/')) {
+    if (req.method === 'GET' && pathname.startsWith('/instance/')) {
       this.handleInstanceStream(pathname.slice('/instance/'.length), req, res)
       return
     }
@@ -266,6 +311,7 @@ export class HostServer extends EventEmitter {
         // must not pin the FSM.
         changed = this.tracker.remove(sessionId)
         this.sessionPanes.delete(sessionId)
+        this.sessionOwners.delete(sessionId)
         if (herdrPaneId) releaseAgent(herdrPaneId)
       } else {
         const state = harness.stateForHookEvent(event, payload)
@@ -305,7 +351,7 @@ export class HostServer extends EventEmitter {
       }
     }
     if (wrapperId) this.wrapperHarness.set(wrapperId, harness)
-    const id = String(this.nextInstanceId++)
+    const id = randomUUID()
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ instanceId: id, cwd, wrapperId }))
     logger.info('client instance registered', { id, cwd, wrapperId, kind })
@@ -318,8 +364,18 @@ export class HostServer extends EventEmitter {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): void {
+    if (this.instances.has(id)) {
+      res.writeHead(409)
+      res.end()
+      return
+    }
+    const pending = this.pendingInstances.get(id)
+    if (!pending) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
     sse(res)
-    const pending = this.pendingInstances.get(id) ?? { cwd: '', wrapperId: null }
     this.instances.set(id, { res, ...pending })
     this.pendingInstances.delete(id)
     const heartbeat = setInterval(() => res.write(': hb\n\n'), HEARTBEAT_MS)
@@ -327,7 +383,7 @@ export class HostServer extends EventEmitter {
     req.on('close', () => {
       clearInterval(heartbeat)
       const instance = this.instances.get(id)
-      if (!instance) return
+      if (!instance || instance.res !== res) return
       this.instances.delete(id)
       if (instance.wrapperId && this.removeSessionsForOwner(instance.wrapperId)) {
         this.emit('aggregate', this.tracker.aggregate())

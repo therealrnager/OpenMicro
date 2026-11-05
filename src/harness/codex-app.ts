@@ -3,7 +3,7 @@
 // resolve to tagged strings that execute() turns into `open` deep links or
 // System Events keystrokes into the frontmost Codex window.
 
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile, execFileSync, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,6 +30,36 @@ const KEY_EQUIVALENTS: Record<string, string> = {
   '\x1b[109;6u': 'key down control\nkey down shift\nkey code 46\nkey up shift\nkey up control',
 }
 
+// Only commands emitted by our own action mapper may cross into AppleScript.
+// Stream bytes are data, never an unrestricted scripting interface.
+const ALLOWED_SCRIPTS = new Set([
+  ...Object.values(KEY_EQUIVALENTS),
+  'keystroke return',
+  'key code 53',
+  'key down control\nkey down shift\nkey down "d"',
+  'key up "d"\nkey up shift\nkey up control',
+  'key down control\nkey down option\nkey code 24\nkey up option\nkey up control',
+  'key down control\nkey down option\nkey code 27\nkey up option\nkey up control',
+])
+
+function allowedDeepLink(payload: string): boolean {
+  if (payload === 'codex://threads/new') return true
+  if (
+    /^codex:\/\/threads\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+      payload,
+    )
+  )
+    return true
+  const prefix = 'codex://new?prompt='
+  if (!payload.startsWith(prefix)) return false
+  try {
+    const text = payload.slice(prefix.length)
+    return encodeURIComponent(decodeURIComponent(text)) === text
+  } catch {
+    return false
+  }
+}
+
 // Synthetic `key down` events are system-wide: a chord whose `key up` never
 // lands (osascript error/timeout, process death, interleaved chords) leaves
 // modifiers stuck for the whole machine — Ctrl turns clicks into right-clicks
@@ -47,19 +77,28 @@ const RELEASE_ALL: string[] = [
 // interleave their key down/up steps and strand a modifier. execFile timeout
 // bounds a hung osascript so the queue always drains.
 let osascriptQueue: Promise<void> = Promise.resolve()
+let scriptGeneration = 0
+let activeScript: ChildProcess | undefined
 function enqueueOsascript(
   args: string[],
   done: (err: Error | null, stderr?: string) => void,
 ): void {
-  osascriptQueue = osascriptQueue.then(
-    () =>
-      new Promise<void>((resolve) => {
-        execFile('osascript', args, { timeout: 5000 }, (err, _stdout, stderr) => {
-          done(err, stderr)
-          resolve()
-        })
-      }),
-  )
+  const generation = scriptGeneration
+  osascriptQueue = osascriptQueue.then(() => {
+    if (generation !== scriptGeneration) return
+    return new Promise<void>((resolve) => {
+      let completed = false
+      const child = execFile('osascript', args, { timeout: 5000 }, (err, _stdout, stderr) => {
+        completed = true
+        activeScript = undefined
+        // A killed process may have delivered a key-down just before it died.
+        if (generation !== scriptGeneration) releaseAllKeys()
+        else done(err, stderr)
+        resolve()
+      })
+      if (!completed) activeScript = child
+    })
+  })
 }
 
 /**
@@ -326,9 +365,9 @@ export const codexAppHarness: Harness = {
         `\x1b[31m●\x1b[0m ${(stderr || err.message).trim()} — if this is a permission error, allow your terminal under System Settings → Privacy & Security → Accessibility and Automation`,
       )
     }
-    if (tag === 'open') {
+    if (tag === 'open' && allowedDeepLink(payload)) {
       execFile('open', [payload], (err) => report(err))
-    } else if (tag === 'osascript') {
+    } else if (tag === 'osascript' && ALLOWED_SCRIPTS.has(payload)) {
       // System Events keystrokes require the terminal to have Accessibility /
       // Automation permission. A newline in the payload runs as sequential
       // System Events statements (e.g. select-all then delete).
@@ -344,13 +383,16 @@ export const codexAppHarness: Harness = {
           // A failed/timed-out chord may have landed its `key down` steps but
           // not the matching `key up` — release everything rather than leave
           // the whole machine with a stuck modifier.
-          if (err && payload.includes('key down')) releaseAllKeys()
+          if (err && /key (down|up)/.test(payload)) releaseAllKeys()
         },
       )
     }
   },
 
   dispose(): void {
+    ++scriptGeneration // invalidate queued key-downs before releasing keys
+    activeScript?.kill('SIGKILL')
+    activeScript = undefined
     releaseAllKeys()
   },
 }

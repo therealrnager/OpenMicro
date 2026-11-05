@@ -288,8 +288,8 @@ describe('codex-app harness', () => {
   })
 
   it('executes open: bytes via execFile with an arg array', () => {
-    codexAppHarness.execute?.('open:codex://new')
-    expect(execFile).toHaveBeenCalledWith('open', ['codex://new'], expect.any(Function))
+    codexAppHarness.execute?.('open:codex://threads/new')
+    expect(execFile).toHaveBeenCalledWith('open', ['codex://threads/new'], expect.any(Function))
   })
 
   it('executes osascript: bytes as activate + System Events keystroke', async () => {
@@ -311,7 +311,7 @@ describe('codex-app harness', () => {
   })
 
   it('serializes concurrent osascript chords instead of interleaving them', async () => {
-    codexAppHarness.execute?.('osascript:key down control\nkey up control')
+    codexAppHarness.execute?.('osascript:key down control\nkey down shift\nkey down "d"')
     codexAppHarness.execute?.('osascript:keystroke return')
     await new Promise((resolve) => setImmediate(resolve))
     expect(execFile).toHaveBeenCalledTimes(2)
@@ -325,12 +325,45 @@ describe('codex-app harness', () => {
       const cb = args[args.length - 1]
       if (typeof cb === 'function') cb(new Error('timeout'), '', '')
     })
-    codexAppHarness.execute?.('osascript:key down control\nkey code 24\nkey up control')
+    codexAppHarness.execute?.(
+      'osascript:key down control\nkey down option\nkey code 24\nkey up option\nkey up control',
+    )
     await new Promise((resolve) => setImmediate(resolve))
     expect(execFileSync).toHaveBeenCalledWith(
       'osascript',
       expect.arrayContaining(['tell application "System Events" to key up control']),
       { timeout: 3000 },
+    )
+  })
+
+  it('cancels queued chords and kills an active script before disposing', async () => {
+    const kill = vi.fn()
+    let finish: ((err: Error | null, stdout: string, stderr: string) => void) | undefined
+    execFile.mockImplementation((...args: unknown[]) => {
+      finish = args.at(-1) as typeof finish
+      return { kill }
+    })
+    codexAppHarness.execute?.('osascript:keystroke return')
+    codexAppHarness.execute?.('osascript:key down control\nkey down shift\nkey down "d"')
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(execFile).toHaveBeenCalledTimes(1)
+    codexAppHarness.dispose?.()
+    expect(kill).toHaveBeenCalledWith('SIGKILL')
+    expect(execFileSync).toHaveBeenCalledTimes(1)
+    finish!(new Error('killed'), '', '')
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(execFileSync).toHaveBeenCalledTimes(2)
+    expect(execFile).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves prompt punctuation and Unicode as a single encoded URL argument', () => {
+    const prompt = 'Review "hi" & $(touch /tmp/nope) 🎮'
+    const resolved = codexAppHarness.resolveAction({ type: 'prompt', text: prompt }, ctx)!
+    codexAppHarness.execute?.(resolved.bytes)
+    expect(execFile).toHaveBeenCalledWith(
+      'open',
+      ['codex://new?prompt=' + encodeURIComponent(prompt)],
+      expect.any(Function),
     )
   })
 
@@ -345,6 +378,19 @@ describe('codex-app harness', () => {
       ]),
       { timeout: 3000 },
     )
+  })
+
+  it.each([
+    'osascript:do shell script "id"',
+    'osascript:keystroke return\ntell application "Terminal" to activate',
+    'open:file:///tmp/untrusted.app',
+    'open:https://example.com',
+    'open:codex://new?prompt=hello&cwd=/tmp/untrusted',
+    'open:codex://threads/new?run=anything',
+  ])('rejects commands outside the controller vocabulary: %s', async (bytes) => {
+    codexAppHarness.execute?.(bytes)
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(execFile).not.toHaveBeenCalled()
   })
 
   it('ignores untagged bytes', () => {

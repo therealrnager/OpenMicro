@@ -151,6 +151,15 @@ class StickTracker {
     return null
   }
 
+  reset(): void {
+    this.x = 0
+    this.y = 0
+    this.angleAccum = 0
+    this.lastAngle = null
+    this.rotating = false
+    this.cancelFlick()
+  }
+
   private cancelFlick(): void {
     this.flickArmed = false
     this.flickDirection = null
@@ -202,7 +211,22 @@ export class LayerRouter {
     return null
   }
 
+  /** Cancel held effects even when a layer is re-selected. */
+  onInputReset: (() => void) | null = null
+
+  reset(): void {
+    this.onInputReset?.()
+    this.held.clear()
+    this.ignoredHeld.clear()
+    this.l1Held = false
+    this.guardUntil = 0
+    this.lastControl = null
+    this.leftStick.reset()
+    this.rightStick.reset()
+  }
+
   private switchLayer(index: number): void {
+    this.onInputReset?.()
     const changed = index !== this.layer
     this.layer = index
     this.guardUntil = this.now() + GUARD_WINDOW_MS

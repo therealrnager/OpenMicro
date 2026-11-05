@@ -2,15 +2,22 @@
 // the port, this instance registers itself and receives forwarded keystrokes
 // for its own pty over SSE.
 
+import { randomBytes } from 'node:crypto'
+import { hostProof, secretEquals } from './auth.js'
 import { logger } from './logger.js'
 import { HOST_URL } from './ports.js'
 
 /** True if the process listening on the singleton port is an openmicro host. */
-export async function isOpenmicroHost(): Promise<boolean> {
+export async function isOpenmicroHost(token: string, baseUrl = HOST_URL): Promise<boolean> {
   try {
-    const res = await fetch(`${HOST_URL}/health`, { signal: AbortSignal.timeout(1000) })
-    const body = (await res.json()) as { app?: string }
-    return body.app === 'openmicro'
+    const challenge = randomBytes(32).toString('hex')
+    const res = await fetch(`${baseUrl}/health?challenge=${challenge}`, {
+      signal: AbortSignal.timeout(1000),
+      redirect: 'error',
+    })
+    if (!res.ok) return false
+    const body = (await res.json()) as { app?: string; proof?: string }
+    return body.app === 'openmicro' && secretEquals(body.proof, hostProof(token, challenge))
   } catch {
     return false
   }
@@ -26,14 +33,21 @@ export async function isOpenmicroHost(): Promise<boolean> {
  * Returns:
  *     None.
  */
-export function reportTerminalFocus(wrapperId: string, focused: boolean): void {
-  fetch(`${HOST_URL}/focus`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ wrapperId, focused }),
-  }).catch(() => {
-    // host gone or not openmicro — focus reports are best-effort
-  })
+export function reportTerminalFocus(wrapperId: string, focused: boolean, token: string): void {
+  void isOpenmicroHost(token)
+    .then(async (trusted) => {
+      if (!trusted) return
+      await fetch(`${HOST_URL}/focus`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ wrapperId, focused }),
+        signal: AbortSignal.timeout(1000),
+        redirect: 'error',
+      })
+    })
+    .catch(() => {
+      // host gone or not openmicro — focus reports are best-effort
+    })
 }
 
 /**
@@ -51,17 +65,26 @@ export async function runAsClient(
   wrapperId: string,
   kind: string,
   write: (bytes: string) => void,
+  token: string,
+  baseUrl = HOST_URL,
 ): Promise<void> {
-  const registration = await fetch(`${HOST_URL}/register`, {
+  if (!(await isOpenmicroHost(token, baseUrl))) throw new Error('Untrusted OpenMicro host')
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+  const registration = await fetch(`${baseUrl}/register`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
+    signal: AbortSignal.timeout(1000),
+    redirect: 'error',
     body: JSON.stringify({ cwd: process.cwd(), pid: process.pid, wrapperId, kind }),
   })
+  if (!registration.ok) throw new Error(`Registration failed: ${registration.status}`)
   const { instanceId } = (await registration.json()) as { instanceId: string }
+  if (typeof instanceId !== 'string' || !/^[a-f0-9-]{36}$/.test(instanceId))
+    throw new Error('Invalid OpenMicro instance ID')
   logger.info('running as client instance', { instanceId, kind })
 
-  const stream = await fetch(`${HOST_URL}/instance/${instanceId}`)
-  if (!stream.body) return
+  const stream = await fetch(`${baseUrl}/instance/${instanceId}`, { headers, redirect: 'error' })
+  if (!stream.ok || !stream.body) throw new Error(`Keystroke stream failed: ${stream.status}`)
 
   const decoder = new TextDecoder()
   let buffer = ''

@@ -8,6 +8,7 @@
 // forwards terminal keystrokes to whichever session has focus.
 
 import { execFile } from 'node:child_process'
+import { getAuthToken } from './auth.js'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { isOpenmicroHost, reportTerminalFocus, runAsClient } from './client.js'
@@ -91,6 +92,7 @@ try {
   process.exit(1)
 }
 
+const authToken = getAuthToken()
 const install = harness.installHooks()
 if (install.trustNotice) console.error(install.trustNotice)
 
@@ -103,12 +105,15 @@ const wrapperId = randomUUID()
 const herdrPaneId = process.env.HERDR_PANE_ID
 if (herdrPaneId) reportAgentState(herdrPaneId, 'idle')
 
-const server = new HostServer(harness, wrapperId)
+const server = new HostServer(harness, wrapperId, authToken)
 const isHost = await server.listen(HOST_PORT)
 
 let hid: HidManager | null = null
 
+let releaseInputs = (): void => {}
+
 function shutdown(): void {
+  releaseInputs()
   agent.dispose()
   if (herdrPaneId) releaseAgent(herdrPaneId)
   if (isHost) {
@@ -155,7 +160,7 @@ const agent: Pick<AgentPty, 'write' | 'dispose'> = usesPty
       // Terminal focus changes (window switch, tmux/herdr pane click) go to the
       // host — voice must disengage the moment its terminal is no longer active.
       // The host posts to itself: one path for every wrapper.
-      (focused) => reportTerminalFocus(wrapperId, focused),
+      (focused) => reportTerminalFocus(wrapperId, focused, authToken),
     )
   : {
       write: (bytes: string) => {
@@ -192,8 +197,8 @@ process.on('SIGTERM', () => {
 if (!isHost) {
   // ── Client: another openmicro owns the controller + state aggregation. ──
   guiStatus('another openmicro instance owns the controller — running as client', 33)
-  if (await isOpenmicroHost()) {
-    runAsClient(wrapperId, invocation.kind, (bytes) => agent.write(bytes)).catch((err) =>
+  if (await isOpenmicroHost(authToken)) {
+    runAsClient(wrapperId, invocation.kind, (bytes) => agent.write(bytes), authToken).catch((err) =>
       logger.warn('client stream failed', err),
     )
   } else {
@@ -204,6 +209,7 @@ if (!isHost) {
   hid = new HidManager()
   const router = new LayerRouter(config)
   const repeater = new KeyRepeater()
+  const heldGuiVoice = new Set<ButtonId>()
   const thinkingLevels = new Map<string, number>()
   let focusSessionId: string | null = null
   let herdrWorkspaceId: string | null = null // null = local mode (no herdr space selected)
@@ -230,6 +236,10 @@ if (!isHost) {
 
   /** Terminal writes go to the focused session's instance, else our own pty. */
   function writeToFocused(bytes: string): void {
+    if (!usesPty) {
+      agent.write(bytes)
+      return
+    }
     // The foreign-pane guard protects terminal panes; a GUI harness targets
     // the app itself, so pane focus must not gate its input.
     if (herdrForeignFocus && usesPty) return // typing into an invisible pane is worse than a no-op
@@ -500,6 +510,17 @@ if (!isHost) {
     scheduleFeedback()
   })
 
+  function releaseHeldInputs(): void {
+    repeater.releaseAll()
+    if (heldGuiVoice.size) {
+      heldGuiVoice.clear()
+      dispatchAction({ type: 'push_to_talk', pressed: false }, deps)
+    }
+    if (usesPty) stopVoice()
+  }
+  router.onInputReset = releaseHeldInputs
+  releaseInputs = () => router.reset()
+
   let padType: ControllerType = 'generic-hid'
   // One status line per routed action: "triangle → push-to-talk" (physical
   // name per pad family), replacing the raw keystroke payload dump.
@@ -509,6 +530,7 @@ if (!isHost) {
   hid.on('data', (e: ControllerEvent) => {
     try {
       if (e.kind === 'connected') {
+        router.reset()
         padType = e.controllerType
         logger.info(`Controller connected: ${e.controllerType}`)
         reportGuiStatus(controllerStatus(e))
@@ -516,9 +538,16 @@ if (!isHost) {
         return
       }
       if (e.kind === 'disconnected') {
-        repeater.releaseAll()
+        router.reset()
         reportGuiStatus(controllerStatus(e))
         return
+      }
+      // Release bookkeeping must run before routing: guard windows intentionally
+      // swallow releases, and the new layer may not bind this button at all.
+      if (e.kind === 'button' && !e.pressed) {
+        repeater.release(e.button)
+        if (heldGuiVoice.delete(e.button) && heldGuiVoice.size === 0)
+          dispatchAction({ type: 'push_to_talk', pressed: false }, deps)
       }
       const action = router.route(e)
       if (!action) return
@@ -534,8 +563,14 @@ if (!isHost) {
       // GUI dictation is hold-to-talk: forward both button edges so the chord
       // stays down exactly while the button is held (pty voice stays a toggle).
       if (!usesPty && action.type === 'push_to_talk' && e.kind === 'button') {
-        if (e.pressed) announce(action)
-        dispatchAction({ ...action, pressed: e.pressed }, deps)
+        if (e.pressed && !heldGuiVoice.has(e.button)) {
+          const alreadyHeld = heldGuiVoice.size > 0
+          heldGuiVoice.add(e.button)
+          if (!alreadyHeld) {
+            announce(action)
+            dispatchAction({ ...action, pressed: true }, deps)
+          }
+        }
         return
       }
       if (e.kind === 'button' && !e.pressed) return // press-only for non-repeating buttons
